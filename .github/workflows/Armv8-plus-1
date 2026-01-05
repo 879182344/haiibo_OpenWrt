@@ -1,0 +1,552 @@
+name: ARMv8 Plus OpenWrt
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  CONFIG_FILE: configs/armv8-plus.config
+  DIY_SCRIPT: diy-script.sh
+  CLASH_KERNEL: arm64
+  CACHE_TOOLCHAIN: true
+  UPLOAD_BIN_DIR: false
+  FIRMWARE_RELEASE: true
+  FIRMWARE_TAG: ROOTFS_PLUS
+  OPENWRT_RELEASE: true
+  OPENWRT_TAG: ARMv8_PLUS
+  TZ: Asia/Shanghai
+  # 添加编译控制参数
+  COMPILE_JOBS: 2  # 限制编译线程数，避免内存不足
+
+jobs:
+  Build:
+    runs-on: ubuntu-22.04
+    outputs:
+      COMMIT_AUTHOR: ${{ steps.clone.outputs.COMMIT_AUTHOR }}
+      COMMIT_DATE: ${{ steps.clone.outputs.COMMIT_DATE }}
+      COMMIT_MESSAGE: ${{ steps.clone.outputs.COMMIT_MESSAGE }}
+      COMMIT_HASH: ${{ steps.clone.outputs.COMMIT_HASH }}
+      DEVICE_TARGET: ${{ steps.variable.outputs.DEVICE_TARGET }}
+      DEVICE_SUBTARGET: ${{ steps.variable.outputs.DEVICE_SUBTARGET }}
+    
+    steps:
+      - name: Check Server Performance
+        run: |
+          echo "警告⚠"
+          echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
+          echo -e "已知CPU型号(降序): 7763，8370C，8272CL，8171M，E5-2673\n"
+          echo "--------------------------CPU信息--------------------------"
+          echo "CPU物理数量: $(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
+          echo "CPU核心数量: $(nproc)"
+          echo -e "CPU型号信息:$(cat /proc/cpuinfo | grep -m1 name | awk -F: '{print $2}')\n"
+          echo "--------------------------内存信息--------------------------"
+          echo "已安装内存详细信息:"
+          echo -e "$(sudo lshw -short -C memory | grep GiB)\n"
+          echo "--------------------------硬盘信息--------------------------"
+          echo "硬盘数量: $(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
+      
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # 清理 Docker 镜像释放空间
+          docker rmi $(docker images -q) 2>/dev/null || true
+          
+          # 移除不必要的软件包
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* msodbcsql17 mssql-tools 2>/dev/null || true
+          
+          sudo -E apt-get -y update
+          
+          # 安装 OpenWrt 编译依赖
+          sudo -E apt-get -y install \
+            build-essential \
+            libncurses5-dev \
+            libncursesw5-dev \
+            zlib1g-dev \
+            gawk \
+            git \
+            gettext \
+            libssl-dev \
+            xsltproc \
+            wget \
+            unzip \
+            python3 \
+            python3-setuptools \
+            rsync \
+            subversion \
+            bc \
+            flex \
+            bison \
+            gcc-multilib \
+            g++-multilib \
+            libelf-dev \
+            cpio \
+            quilt \
+            rename \
+            file \
+            time \
+            locales
+          
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get -y clean
+          sudo timedatectl set-timezone "$TZ"
+          
+          # 设置 locale
+          sudo locale-gen en_US.UTF-8
+      
+      - name: Combine Disks
+        uses: easimon/maximize-build-space@master
+        with:
+          swap-size-mb: 2048  # 增加交换空间
+          temp-reserve-mb: 200
+          root-reserve-mb: 2048
+      
+      - name: Checkout
+        uses: actions/checkout@v3
+      
+      - name: Clone Source Code
+        id: clone
+        run: |
+          df -hT $GITHUB_WORKSPACE
+          
+          # 使用深度克隆避免部分文件缺失
+          git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
+          
+          cd openwrt
+          echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
+          
+          # 获取提交信息
+          COMMIT_AUTHOR=$(git show -s --date=short --format="作者: %an")
+          echo "COMMIT_AUTHOR=$COMMIT_AUTHOR" >> $GITHUB_ENV
+          echo "COMMIT_AUTHOR=$COMMIT_AUTHOR" >> $GITHUB_OUTPUT
+          
+          COMMIT_DATE=$(git show -s --date=short --format="时间: %ci")
+          echo "COMMIT_DATE=$COMMIT_DATE" >> $GITHUB_ENV
+          echo "COMMIT_DATE=$COMMIT_DATE" >> $GITHUB_OUTPUT
+          
+          COMMIT_MESSAGE=$(git show -s --date=short --format="内容: %s")
+          echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> $GITHUB_ENV
+          echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> $GITHUB_OUTPUT
+          
+          COMMIT_HASH=$(git show -s --date=short --format="hash: %H")
+          echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_ENV
+          echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_OUTPUT
+      
+      - name: Generate Variables
+        id: variable
+        run: |
+          # 复制配置文件
+          [ -f "${{ env.CONFIG_FILE }}" ] && cp ${{ env.CONFIG_FILE }} $OPENWRT_PATH/.config
+          
+          cd $OPENWRT_PATH
+          
+          # 检查配置
+          make defconfig > /dev/null 2>&1
+          
+          SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
+          echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
+          
+          DEVICE_TARGET=$(sed -n 's/^CONFIG_TARGET_BOARD="\(.*\)"/\1/p' .config 2>/dev/null)
+          if [ -z "$DEVICE_TARGET" ]; then
+            DEVICE_TARGET=$(grep CONFIG_TARGET_BOARD .config | awk -F '"' '{print $2}')
+          fi
+          echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+          echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_OUTPUT
+          
+          DEVICE_SUBTARGET=$(sed -n 's/^CONFIG_TARGET_SUBTARGET="\(.*\)"/\1/p' .config 2>/dev/null)
+          if [ -z "$DEVICE_SUBTARGET" ]; then
+            DEVICE_SUBTARGET=$(grep CONFIG_TARGET_SUBTARGET .config | awk -F '"' '{print $2}')
+          fi
+          echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+          echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_OUTPUT
+      
+      - name: Cache Toolchain
+        if: env.CACHE_TOOLCHAIN == 'true'
+        uses: HiGarfield/cachewrtbuild@main
+        with:
+          ccache: false
+          mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ github.sha }}
+          prefix: ${{ env.OPENWRT_PATH }}
+      
+      - name: Install Feeds
+        run: |
+          cd $OPENWRT_PATH
+          
+          # 更新 feeds
+          echo "更新 feeds..."
+          ./scripts/feeds update -a
+          
+          # 安装 feeds
+          echo "安装 feeds..."
+          ./scripts/feeds install -a
+      
+      - name: Load Custom Configuration
+        run: |
+          # 复制自定义文件
+          [ -d "$GITHUB_WORKSPACE/files" ] && cp -rf $GITHUB_WORKSPACE/files $OPENWRT_PATH/
+          [ -f "${{ env.CONFIG_FILE }}" ] && cp ${{ env.CONFIG_FILE }} $OPENWRT_PATH/.config
+          
+          # 设置脚本权限
+          [ -d "$GITHUB_WORKSPACE/scripts" ] && chmod +x $GITHUB_WORKSPACE/scripts/*.sh
+          [ -f "${{ env.DIY_SCRIPT }}" ] && chmod +x ${{ env.DIY_SCRIPT }}
+          
+          cd $OPENWRT_PATH
+          
+          # 运行自定义脚本
+          if [ -f "$GITHUB_WORKSPACE/$DIY_SCRIPT" ]; then
+            echo "运行自定义脚本..."
+            $GITHUB_WORKSPACE/$DIY_SCRIPT
+          fi
+          
+          # 运行预设脚本
+          if [ -f "$GITHUB_WORKSPACE/scripts/preset-clash-core.sh" ]; then
+            echo "配置 Clash 核心..."
+            $GITHUB_WORKSPACE/scripts/preset-clash-core.sh ${{ env.CLASH_KERNEL }}
+          fi
+          
+          if [ -f "$GITHUB_WORKSPACE/scripts/preset-terminal-tools.sh" ]; then
+            echo "配置终端工具..."
+            $GITHUB_WORKSPACE/scripts/preset-terminal-tools.sh
+          fi
+      
+      - name: Download DL Package
+        run: |
+          cd $OPENWRT_PATH
+          
+          echo "准备配置..."
+          make defconfig
+          
+          echo "开始下载源码包..."
+          # 使用重试机制下载
+          MAX_RETRY=3
+          for i in $(seq 1 $MAX_RETRY); do
+            echo "第 $i 次尝试下载..."
+            if make download -j4; then
+              echo "下载成功"
+              break
+            elif [ $i -eq $MAX_RETRY ]; then
+              echo "下载失败，达到最大重试次数"
+              exit 1
+            else
+              echo "下载失败，等待10秒后重试..."
+              sleep 10
+            fi
+          done
+          
+          # 删除可能损坏的小文件
+          echo "清理损坏的小文件..."
+          find dl -size -1024c -exec echo "删除: {}" \; -delete
+      
+      - name: Clean Cache if Previous Build Failed
+        run: |
+          cd $OPENWRT_PATH
+          # 清理可能损坏的编译状态
+          echo "清理编译状态..."
+          rm -rf build_dir/toolchain-*/.built build_dir/toolchain-*/.configured 2>/dev/null || true
+          rm -rf staging_dir/toolchain-*/.built staging_dir/toolchain-*/.configured 2>/dev/null || true
+      
+      - name: Compile Firmware
+        id: compile
+        run: |
+          cd $OPENWRT_PATH
+          
+          # 创建必要目录
+          mkdir -p files/etc/uci-defaults
+          if [ -f "$GITHUB_WORKSPACE/scripts/init-settings.sh" ]; then
+            cp $GITHUB_WORKSPACE/scripts/init-settings.sh files/etc/uci-defaults/99-init-settings
+          fi
+          
+          echo "当前工作目录: $(pwd)"
+          echo "磁盘空间情况:"
+          df -h .
+          
+          echo "内存使用情况:"
+          free -h
+          
+          # 设置编译线程数
+          JOBS=${{ env.COMPILE_JOBS }}
+          echo "使用 $JOBS 线程编译"
+          
+          # 第一阶段：编译工具链（单独处理，便于调试）
+          echo "=== 第一阶段：编译工具链 ==="
+          echo "开始编译工具链..."
+          
+          # 编译工具链，使用详细输出
+          if make toolchain/compile -j$JOBS V=sc 2>&1 | tee /tmp/toolchain_compile.log; then
+            echo "✅ 工具链编译成功"
+            TOOLCHAIN_SUCCESS=true
+          else
+            echo "❌ 工具链编译失败"
+            TOOLCHAIN_SUCCESS=false
+          fi
+          
+          # 如果工具链编译失败，尝试单线程编译
+          if [ "$TOOLCHAIN_SUCCESS" = "false" ]; then
+            echo "尝试使用单线程重新编译工具链..."
+            
+            # 先清理工具链
+            make toolchain/clean
+            
+            if make toolchain/compile -j1 V=s 2>&1 | tee /tmp/toolchain_retry.log; then
+              echo "✅ 单线程工具链编译成功"
+              TOOLCHAIN_SUCCESS=true
+            else
+              echo "❌ 工具链编译最终失败"
+              
+              # 输出错误信息
+              echo "=== 工具链编译错误日志 ==="
+              tail -200 /tmp/toolchain_retry.log
+              
+              echo "=== 可能的错误文件 ==="
+              find build_dir -name "*.log" -type f | head -10 | while read logfile; do
+                echo "检查: $logfile"
+                tail -50 "$logfile" | grep -i "error\|failed\|stop\|missing" || true
+              done
+              
+              exit 1
+            fi
+          fi
+          
+          # 第二阶段：编译固件
+          echo "=== 第二阶段：编译固件 ==="
+          echo "开始编译完整固件..."
+          
+          # 尝试编译固件
+          MAX_ATTEMPTS=2
+          for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
+            echo "第 $ATTEMPT 次编译尝试..."
+            
+            if [ $ATTEMPT -eq 1 ]; then
+              # 第一次尝试使用指定线程数
+              if make -j$JOBS 2>&1 | tee /tmp/build_attempt_$ATTEMPT.log; then
+                echo "✅ 固件编译成功！"
+                BUILD_SUCCESS=true
+                break
+              else
+                echo "⚠ 第一次编译失败，准备重试..."
+                BUILD_SUCCESS=false
+              fi
+            else
+              # 第二次尝试使用单线程并显示详细信息
+              echo "使用单线程详细模式重试..."
+              if make -j1 V=s 2>&1 | tee /tmp/build_attempt_$ATTEMPT.log; then
+                echo "✅ 单线程编译成功！"
+                BUILD_SUCCESS=true
+                break
+              else
+                echo "❌ 最终编译失败"
+                BUILD_SUCCESS=false
+                
+                # 输出错误摘要
+                echo "=== 编译错误摘要 ==="
+                grep -i "error\|failed\|stop\|undefined" /tmp/build_attempt_*.log | head -30
+                
+                # 查找具体错误文件
+                echo "=== 检查编译日志文件 ==="
+                find build_dir -name "*.log" -type f -exec sh -c '
+                  echo "检查文件: $1"
+                  tail -20 "$1" | grep -i "error\|failed" && echo "---"
+                ' _ {} \;
+                
+                exit 1
+              fi
+            fi
+          done
+          
+          if [ "$BUILD_SUCCESS" = "true" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+            echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+          else
+            echo "编译失败"
+            exit 1
+          fi
+      
+      - name: Check Space Usage
+        if: (!cancelled())
+        run: |
+          echo "编译完成后的磁盘空间情况:"
+          df -hT
+      
+      - name: Upload Bin Directory
+        if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+          path: ${{ env.OPENWRT_PATH }}/bin
+          retention-days: 7
+      
+      - name: Organize Files
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd $OPENWRT_PATH/bin/targets/*/*
+          
+          # 复制校验文件
+          [ -f sha256sums ] && cat sha256sums
+          
+          # 复制配置文件
+          cp $OPENWRT_PATH/.config build.config 2>/dev/null || true
+          
+          # 处理 packages
+          if [ -d "$OPENWRT_PATH/bin/packages" ]; then
+            mkdir -p packages
+            find $OPENWRT_PATH/bin/packages -name "*.ipk" -exec cp {} packages/ \;
+            tar -zcf Packages.tar.gz packages
+            rm -rf packages
+          fi
+          
+          # 清理不需要的文件
+          rm -rf feeds.buildinfo version.buildinfo 2>/dev/null || true
+          
+          echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
+      
+      - name: Upload Firmware To Artifact
+        if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
+          path: ${{ env.FIRMWARE_PATH }}
+          retention-days: 7
+      
+      - name: Upload Firmware To Release
+        if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          name: R${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
+          allowUpdates: true
+          tag: ${{ env.FIRMWARE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: ${{ env.FIRMWARE_PATH }}/*
+          body: |
+            **This is Temporary Firmware for Armvirt 64**
+            
+            ### 📒 固件信息
+            - 🚀 成品固件点击此处跳转➦[PLUS](https://github.com/haiibo/OpenWrt/releases/tag/ARMv8_PLUS)即可下载
+            - 💻 平台架构: ${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }} (多功能临时固件)
+            - ⚽ 固件源码: ${{ env.REPO_URL }}
+            - 💝 源码分支: ${{ env.REPO_BRANCH }}
+            - 🌐 默认地址: 192.168.1.1
+            - 🔑 默认密码: password
+            
+            ### 🧊 固件版本
+            - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
+            - ${{ env.COMMIT_AUTHOR }}
+            - ${{ env.COMMIT_DATE }}
+            - ${{ env.COMMIT_MESSAGE }}
+            - ${{ env.COMMIT_HASH }}
+  
+  Package:
+    needs: [Build]
+    runs-on: ubuntu-22.04
+    env:
+      COMMIT_AUTHOR: ${{ needs.Build.outputs.COMMIT_AUTHOR }}
+      COMMIT_DATE: ${{ needs.Build.outputs.COMMIT_DATE }}
+      COMMIT_MESSAGE: ${{ needs.Build.outputs.COMMIT_MESSAGE }}
+      COMMIT_HASH: ${{ needs.Build.outputs.COMMIT_HASH }}
+      DEVICE_TARGET: ${{ needs.Build.outputs.DEVICE_TARGET }}
+      DEVICE_SUBTARGET: ${{ needs.Build.outputs.DEVICE_SUBTARGET }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # 清理 Docker 镜像
+          docker rmi $(docker images -q) 2>/dev/null || true
+          
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install wget curl
+          sudo timedatectl set-timezone "$TZ"
+      
+      - name: Download Armvirt Firmware
+        id: download
+        run: |
+          FIRMWARE_PATH=openwrt/bin/targets/armvirt/64
+          [ -d $FIRMWARE_PATH ] || mkdir -p $FIRMWARE_PATH
+          
+          cd $FIRMWARE_PATH
+          
+          # 尝试下载固件
+          echo "下载 Armvirt 固件..."
+          
+          # 这里需要根据实际情况调整下载逻辑
+          # 假设从当前仓库的 releases 下载
+          RELEASE_URL="https://api.github.com/repos/$GITHUB_REPOSITORY/releases"
+          
+          # 获取最新的 rootfs.tar.gz 文件
+          DOWNLOAD_URL=$(curl -s $RELEASE_URL | grep -o '"browser_download_url": "[^"]*rootfs[^"]*\.tar\.gz"' | head -1 | cut -d'"' -f4)
+          
+          if [ -n "$DOWNLOAD_URL" ]; then
+            echo "下载 URL: $DOWNLOAD_URL"
+            wget -q "$DOWNLOAD_URL" -O openwrt-armvirt-64-rootfs.tar.gz
+            echo "下载成功"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "未找到固件文件"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+          echo "DATE1=$(date +"%y.%m.%d")" >> $GITHUB_ENV
+      
+      - name: Package OpenWrt Firmware
+        if: steps.download.outputs.status == 'success'
+        uses: ophub/flippy-openwrt-actions@main
+        env:
+          OPENWRT_ARMVIRT: openwrt/bin/targets/*/*/*rootfs.tar.gz
+          PACKAGE_SOC: all
+          WHOAMI: Haiibo
+          KERNEL_VERSION_NAME: 5.15.13_6.1.5
+          KERNEL_AUTO_LATEST: true
+          DISTRIB_REVISION: R${{ env.DATE1 }} by Haiibo
+      
+      - name: Upload OpenWrt To Artifact
+        if: env.PACKAGED_STATUS == 'success' && env.OPENWRT_RELEASE != 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.OPENWRT_TAG }}-firmware-${{ env.DATE1 }}
+          path: ${{ env.PACKAGED_OUTPUTPATH }}
+          retention-days: 7
+      
+      - name: Upload OpenWrt To Release
+        if: env.PACKAGED_STATUS == 'success' && env.OPENWRT_RELEASE == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          name: R${{ env.DATE }} for ${{ env.OPENWRT_TAG }}
+          allowUpdates: true
+          removeArtifacts: true
+          tag: ${{ env.OPENWRT_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          body: |
+            **This is OpenWrt Firmware for Armvirt 64**
+            
+            ### 📒 固件信息
+            - 🚀 ARMv8 多功能版，集成插件多适合折腾
+            - 💻 平台架构: ${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+            - ⚽ 固件源码: ${{ env.REPO_URL }}
+            - 💝 源码分支: ${{ env.REPO_BRANCH }}
+            - 🌐 默认地址: 192.168.1.1
+            - 🔑 默认密码: password
+            
+            ### 🍻 安装与更新
+            - 用插件安装: 系统 → 晶晨宝盒 → 安装 OpenWrt → 选择型号 → 安装
+            - 用命令安装: U盘启动成功后输入命令 `openwrt-install-amlogic` 按照英文提示写入到 emmc
+            - 用插件更新: 系统 → 晶晨宝盒 → 在线下载更新 → 完整更新全系统
+            - 用命令更新: 上传固件到 `/mnt/mmcblk2p4` 目录，输入命令 `openwrt-update-amlogic` 即可更新
+            - 注意: 如非 `amlogic` 平台，请将其更改为对应平台 `rockchip` `allwinner`
+            - 部分常见问题及注意事项请参考恩山论坛F大➦[最新帖](https://www.right.com.cn/forum/thread-4076037-1-1.html)
+            
+            ### 🧊 固件版本
+            - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
+            - ${{ env.COMMIT_AUTHOR }}
+            - ${{ env.COMMIT_DATE }}
+            - ${{ env.COMMIT_MESSAGE }}
+            - ${{ env.COMMIT_HASH }}
